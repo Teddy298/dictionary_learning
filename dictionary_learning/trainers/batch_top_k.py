@@ -110,10 +110,7 @@ def ks_topk_triton(
     )
 
     total_passed = count.item()
-    # If too few values passed, or the scratch buffer overflowed, use the exact path.
-    # Overflow means later passing elements were dropped, so the truncated buffer is
-    # not safe to rank locally.
-    if total_passed < k or total_passed > max_out:
+    if total_passed < k:
         post_topk = x.topk(k, sorted=False, dim=-1)
         return post_topk.values, post_topk.indices
 
