@@ -6,6 +6,7 @@ from dictionary_learning.dictionary import (
     AutoEncoderNew,
     JumpReluAutoEncoder,
 )
+from dictionary_learning.trainers.batch_top_k import BatchTopKSAE, ks_topk_triton, triton
 
 
 @pytest.mark.parametrize(
@@ -134,3 +135,68 @@ def test_output_shapes(sae_cls: type) -> None:
     output, features = sae(x, output_features=True)
     assert output.shape == (batch_size, act_dim)
     assert features.shape == (batch_size, dict_size)
+
+
+def test_batch_topk_sae_uses_custom_batch_topk() -> None:
+    """Test that BatchTopKSAE can use a custom flattened top-k implementation."""
+    calls = {}
+
+    def custom_batch_topk(flattened_acts: t.Tensor, k: int) -> tuple[t.Tensor, t.Tensor]:
+        calls["shape"] = tuple(flattened_acts.shape)
+        calls["k"] = k
+        post_topk = flattened_acts.topk(k, sorted=False, dim=-1)
+        return post_topk.values, post_topk.indices
+
+    sae = BatchTopKSAE(
+        activation_dim=2,
+        dict_size=3,
+        k=1,
+        batch_topk=custom_batch_topk,
+        batch_topk_name="custom",
+    )
+
+    with t.no_grad():
+        sae.encoder.weight.data = t.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        sae.encoder.bias.data.zero_()
+        sae.decoder.weight.data = t.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        sae.b_dec.data.zero_()
+
+    x = t.tensor([[1.0, 0.5], [0.2, 3.0]])
+    encoded = sae.encode(x, use_threshold=False)
+
+    assert calls["shape"] == (x.size(0) * sae.dict_size,)
+    assert calls["k"] == sae.k.item() * x.size(0)
+    assert (encoded != 0).sum().item() == sae.k.item() * x.size(0)
+
+
+def test_batch_topk_sae_topk_flag_defaults_to_torch() -> None:
+    sae = BatchTopKSAE(activation_dim=2, dict_size=3, k=1, topk="torch")
+
+    assert sae.topk == "torch"
+    assert sae.batch_topk is None
+    assert sae.batch_topk_name == "torch.topk"
+
+
+@pytest.mark.skipif(triton is None or not t.cuda.is_available(), reason="requires Triton on CUDA")
+def test_ks_topk_triton_falls_back_when_filter_buffer_overflows(monkeypatch: pytest.MonkeyPatch) -> None:
+    k = 32
+    n = int(k * 1.05) + 50_000 + 1_024
+    x = t.zeros(n, device="cuda")
+    x[-k:] = t.arange(1, k + 1, device="cuda", dtype=x.dtype)
+
+    def fake_randint(
+        low: int,
+        high: int,
+        size: tuple[int, ...],
+        device: t.device | None = None,
+    ) -> t.Tensor:
+        del low, high
+        return t.zeros(size, device=device, dtype=t.long)
+
+    monkeypatch.setattr(t, "randint", fake_randint)
+
+    values, indices = ks_topk_triton(x, k)
+    ref = x.topk(k, sorted=True)
+
+    assert t.equal(values.sort().values, ref.values.sort().values)
+    assert t.equal(x[indices].sort().values, ref.values.sort().values)

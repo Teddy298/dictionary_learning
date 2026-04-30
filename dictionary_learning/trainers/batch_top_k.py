@@ -2,8 +2,16 @@ import torch as t
 import torch.nn as nn
 import torch.nn.functional as F
 import einops
+import math
 from collections import namedtuple
-from typing import Optional
+from typing import Callable, Optional
+
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+    tl = None
 
 from ..dictionary import Dictionary
 from ..trainers.trainer import (
@@ -14,13 +22,128 @@ from ..trainers.trainer import (
 )
 
 
+if triton is not None:
+
+    @triton.jit
+    def _filter_topk_kernel(
+        x_ptr,
+        out_vals_ptr,
+        out_idx_ptr,
+        count_ptr,
+        threshold,
+        n_elements,
+        max_out,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+        read_mask = offsets < n_elements
+
+        x = tl.load(x_ptr + offsets, mask=read_mask, other=-float("inf"))
+
+        pass_mask = (x >= threshold) & read_mask
+
+        pass_int = pass_mask.to(tl.int32)
+        n_pass = tl.sum(pass_int)
+
+        if n_pass > 0:
+            global_offset = tl.atomic_add(count_ptr, n_pass)
+            local_offset = tl.cumsum(pass_int) - 1
+            write_idx = global_offset + local_offset
+            write_mask = pass_mask & (write_idx < max_out)
+
+            tl.store(out_vals_ptr + write_idx, x, mask=write_mask)
+            tl.store(out_idx_ptr + write_idx, offsets, mask=write_mask)
+
+
+def ks_topk_triton(
+    x: t.Tensor, k: int, eps: float = 1e-3
+) -> tuple[t.Tensor, t.Tensor]:
+    del eps
+
+    if triton is None:
+        raise RuntimeError("topk='our' requires Triton to be installed.")
+    if not x.is_cuda:
+        raise RuntimeError("topk='our' requires CUDA tensors.")
+
+    n = x.numel()
+    if k <= 0 or k > n:
+        raise ValueError(f"k={k} must satisfy 0 < k <= n={n}")
+    if n < 2:
+        post_topk = x.topk(k, sorted=False, dim=-1)
+        return post_topk.values, post_topk.indices
+
+    sample_size = int((2 / 3) ** (2 / 3) * (n * math.log(n)) ** (2 / 3))
+    sample_size = max(1, min(sample_size, n))
+    sample = x[t.randint(0, n, (sample_size,), device=x.device)]
+
+    alpha = k / n
+    sigma = math.sqrt(sample_size * alpha * (1 - alpha))
+    margin = max(1, int(2.0 * sigma))
+
+    k_sample = min(int(sample_size * alpha) + margin, sample_size)
+
+    sample_top, _ = t.topk(sample, k_sample)
+    threshold = sample_top[-1].item()
+
+    max_out = min(n, int(k * 1.05) + 50_000)
+
+    out_vals = t.empty(max_out, dtype=x.dtype, device=x.device)
+    out_idx = t.empty(max_out, dtype=t.int64, device=x.device)
+    count = t.zeros(1, dtype=t.int32, device=x.device)
+
+    block_size = 4096
+    grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
+
+    _filter_topk_kernel[grid](
+        x,
+        out_vals,
+        out_idx,
+        count,
+        threshold,
+        n,
+        max_out,
+        BLOCK_SIZE=block_size,
+    )
+
+    total_passed = count.item()
+    # If too few values passed, or the scratch buffer overflowed, use the exact path.
+    # Overflow means later passing elements were dropped, so the truncated buffer is
+    # not safe to rank locally.
+    if total_passed < k or total_passed > max_out:
+        post_topk = x.topk(k, sorted=False, dim=-1)
+        return post_topk.values, post_topk.indices
+
+    valid_count = min(total_passed, max_out)
+    valid_vals = out_vals[:valid_count]
+    valid_idx = out_idx[:valid_count]
+
+    final_topk = t.topk(valid_vals, k)
+    return final_topk.values, valid_idx[final_topk.indices]
+
+
 class BatchTopKSAE(Dictionary, nn.Module):
-    def __init__(self, activation_dim: int, dict_size: int, k: int):
+    def __init__(
+        self,
+        activation_dim: int,
+        dict_size: int,
+        k: int,
+        topk: str = "torch",
+        batch_topk: Optional[Callable[[t.Tensor, int], tuple[t.Tensor, t.Tensor]]] = None,
+        batch_topk_name: str = "torch.topk",
+    ):
         super().__init__()
         self.activation_dim = activation_dim
         self.dict_size = dict_size
+        self.topk = topk
+        self.batch_topk_name = batch_topk_name
 
         assert isinstance(k, int) and k > 0, f"k={k} must be a positive integer"
+        if topk not in {"torch", "our"}:
+            raise ValueError(f"topk={topk!r} must be 'torch' or 'our'")
         self.register_buffer("k", t.tensor(k, dtype=t.int))
         self.register_buffer("threshold", t.tensor(-1.0, dtype=t.float32))
 
@@ -34,6 +157,33 @@ class BatchTopKSAE(Dictionary, nn.Module):
         self.encoder.bias.data.zero_()
         self.b_dec = nn.Parameter(t.zeros(activation_dim))
 
+        if batch_topk is not None:
+            self.batch_topk = batch_topk
+            self.batch_topk_name = batch_topk_name
+        elif topk == "our":
+            self.batch_topk = ks_topk_triton
+            self.batch_topk_name = "our"
+        else:
+            self.batch_topk = None
+            self.batch_topk_name = "torch.topk"
+
+    def select_batch_topk(
+        self, flattened_acts: t.Tensor, k: int
+    ) -> tuple[t.Tensor, t.Tensor]:
+        if self.batch_topk is None:
+            post_topk = flattened_acts.topk(k, sorted=False, dim=-1)
+            return post_topk.values, post_topk.indices
+
+        post_topk = self.batch_topk(flattened_acts, k)
+
+        if hasattr(post_topk, "values") and hasattr(post_topk, "indices"):
+            values = post_topk.values
+            indices = post_topk.indices
+        else:
+            values, indices = post_topk
+
+        return values, indices
+
     def encode(
         self, x: t.Tensor, return_active: bool = False, use_threshold: bool = True
     ):
@@ -46,11 +196,12 @@ class BatchTopKSAE(Dictionary, nn.Module):
         else:
             # Flatten and perform batch top-k
             flattened_acts = post_relu_feat_acts_BF.flatten()
-            post_topk = flattened_acts.topk(self.k * x.size(0), sorted=False, dim=-1)
+            topk_count = self.k.item() * x.size(0)
+            topk_values, topk_indices = self.select_batch_topk(flattened_acts, topk_count)
 
             encoded_acts_BF = (
                 t.zeros_like(post_relu_feat_acts_BF.flatten())
-                .scatter_(-1, post_topk.indices, post_topk.values)
+                .scatter_(-1, topk_indices, topk_values)
                 .reshape(post_relu_feat_acts_BF.shape)
             )
 
@@ -86,7 +237,14 @@ class BatchTopKSAE(Dictionary, nn.Module):
         elif "k" in state_dict and k != state_dict["k"].item():
             raise ValueError(f"k={k} != {state_dict['k'].item()}=state_dict['k']")
 
-        autoencoder = cls(activation_dim, dict_size, k)
+        autoencoder = cls(
+            activation_dim,
+            dict_size,
+            k,
+            topk=kwargs.get("topk", "torch"),
+            batch_topk=kwargs.get("batch_topk"),
+            batch_topk_name=kwargs.get("batch_topk_name", "torch.topk"),
+        )
         autoencoder.load_state_dict(state_dict)
         if device is not None:
             autoencoder.to(device)
@@ -114,6 +272,9 @@ class BatchTopKTrainer(SAETrainer):
         device: Optional[str] = None,
         wandb_name: str = "BatchTopKSAE",
         submodule_name: Optional[str] = None,
+        topk: str = "torch",
+        batch_topk: Optional[Callable[[t.Tensor, int], tuple[t.Tensor, t.Tensor]]] = None,
+        batch_topk_name: str = "torch.topk",
     ):
         super().__init__(seed)
         assert layer is not None and lm_name is not None
@@ -128,12 +289,21 @@ class BatchTopKTrainer(SAETrainer):
         self.threshold_beta = threshold_beta
         self.threshold_start_step = threshold_start_step
         self.k_anneal_steps = k_anneal_steps
+        self.topk = topk
 
         if seed is not None:
             t.manual_seed(seed)
             t.cuda.manual_seed_all(seed)
 
-        self.ae = dict_class(activation_dim, dict_size, k)
+        self.batch_topk_name = batch_topk_name
+        self.ae = dict_class(
+            activation_dim,
+            dict_size,
+            k,
+            topk=topk,
+            batch_topk=batch_topk,
+            batch_topk_name=batch_topk_name,
+        )
 
         if device is None:
             self.device = "cuda" if t.cuda.is_available() else "cpu"
@@ -339,6 +509,8 @@ class BatchTopKTrainer(SAETrainer):
             "lm_name": self.lm_name,
             "wandb_name": self.wandb_name,
             "submodule_name": self.submodule_name,
+            "topk": self.topk,
+            "batch_topk_name": self.batch_topk_name,
         }
 
     @staticmethod
