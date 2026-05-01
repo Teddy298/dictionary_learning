@@ -1,4 +1,5 @@
 import argparse
+import multiprocessing as mp
 from pathlib import Path
 
 from nnsight import LanguageModel
@@ -28,6 +29,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sae-batch-size", type=int, default=4096)
     parser.add_argument("--n-ctxs", type=int, default=100)
     parser.add_argument("--save-dir", default="runs/batch_topk")
+    parser.add_argument("--use-wandb", action="store_true")
+    parser.add_argument("--wandb-project", default="dictionary_learning")
+    parser.add_argument("--wandb-entity", default="")
+    parser.add_argument("--log-steps", type=int, default=100)
     return parser.parse_args()
 
 
@@ -76,14 +81,30 @@ def main() -> None:
 
     print(f"Training BatchTopK SAE with topk={topk_impl}")
     print(f"Saving outputs to {save_dir}")
+    if args.use_wandb:
+        print(
+            f"W&B enabled: project={args.wandb_project}, "
+            f"entity={args.wandb_entity or '<default>'}, log_steps={args.log_steps}"
+        )
 
     trainSAE(
         data=buffer,
         trainer_configs=[trainer_cfg],
         steps=args.steps,
         save_dir=str(save_dir),
+        use_wandb=args.use_wandb,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        log_steps=args.log_steps,
+        run_cfg={
+            "model_name": args.model_name,
+            "dataset_name": args.dataset_name,
+            "topk_impl": topk_impl,
+            "save_dir": str(save_dir),
+        },
     )
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     main()
