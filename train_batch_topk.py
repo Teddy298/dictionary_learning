@@ -93,6 +93,24 @@ def run_eval(
     )
 
 
+def clone_dictionary_for_eval(
+    source: BatchTopKSAE,
+    topk_impl: str,
+    device: str,
+    dtype,
+) -> BatchTopKSAE:
+    dictionary = BatchTopKSAE(
+        activation_dim=source.activation_dim,
+        dict_size=source.dict_size,
+        k=int(source.k.item()),
+        topk=topk_impl,
+    ).to(device)
+    dictionary.load_state_dict(source.state_dict())
+    dictionary = dictionary.to(dtype=dtype)
+    dictionary.eval()
+    return dictionary
+
+
 def main() -> None:
     args = parse_args()
     topk_impl = "our" if args.our else "torch"
@@ -163,12 +181,18 @@ def main() -> None:
             return
 
         eval_path = trainer_dir / f"eval_results_step_{step}.json"
+        eval_dictionary = clone_dictionary_for_eval(
+            source=trainers[0].ae,
+            topk_impl=topk_impl,
+            device=args.device,
+            dtype=model.dtype,
+        )
         eval_results = run_eval(
             args=args,
             model=model,
             submodule=submodule,
             activation_dim=activation_dim,
-            dictionary=trainers[0].ae.to(dtype=model.dtype),
+            dictionary=eval_dictionary,
         )
 
         print(f"Evaluation results at step {step}:")
