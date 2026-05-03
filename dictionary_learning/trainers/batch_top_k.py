@@ -92,7 +92,6 @@ def ks_topk_triton(
 
     max_out = min(n, int(k * 1.05) + 50_000)
 
-    out_vals = t.empty(max_out, dtype=x.dtype, device=x.device)
     out_idx = t.empty(max_out, dtype=t.int64, device=x.device)
     count = t.zeros(1, dtype=t.int32, device=x.device)
 
@@ -101,7 +100,7 @@ def ks_topk_triton(
 
     _filter_topk_kernel[grid](
         x,
-        out_vals,
+        t.empty(max_out, dtype=x.dtype, device=x.device),
         out_idx,
         count,
         threshold,
@@ -116,8 +115,10 @@ def ks_topk_triton(
         return post_topk.values, post_topk.indices
 
     valid_count = min(total_passed, max_out)
-    valid_vals = out_vals[:valid_count]
     valid_idx = out_idx[:valid_count]
+    # Re-gather values from the original tensor so autograd can propagate
+    # gradients back through the selected entries.
+    valid_vals = x[valid_idx]
 
     final_topk = t.topk(valid_vals, k)
     return final_topk.values, valid_idx[final_topk.indices]
