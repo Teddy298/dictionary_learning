@@ -2,6 +2,7 @@ import torch as t
 import torch.nn as nn
 import torch.nn.functional as F
 import einops
+import time
 from collections import namedtuple
 from typing import Callable, Optional
 from math import isclose
@@ -90,20 +91,36 @@ class MatryoshkaBatchTopKSAE(Dictionary, nn.Module):
             self.batch_topk = None
             self.batch_topk_name = "torch.topk"
 
+        self.last_topk_time_ms = 0.0
+
     def select_batch_topk(
         self, flattened_acts: t.Tensor, k: int
     ) -> tuple[t.Tensor, t.Tensor]:
+        if flattened_acts.is_cuda:
+            start_event = t.cuda.Event(enable_timing=True)
+            end_event = t.cuda.Event(enable_timing=True)
+            start_event.record()
+        else:
+            start_time = time.perf_counter()
+
         if self.batch_topk is None:
             post_topk = flattened_acts.topk(k, sorted=False, dim=-1)
-            return post_topk.values, post_topk.indices
-
-        post_topk = self.batch_topk(flattened_acts, k)
-
-        if hasattr(post_topk, "values") and hasattr(post_topk, "indices"):
-            values = post_topk.values
-            indices = post_topk.indices
+            values, indices = post_topk.values, post_topk.indices
         else:
-            values, indices = post_topk
+            post_topk = self.batch_topk(flattened_acts, k)
+
+            if hasattr(post_topk, "values") and hasattr(post_topk, "indices"):
+                values = post_topk.values
+                indices = post_topk.indices
+            else:
+                values, indices = post_topk
+
+        if flattened_acts.is_cuda:
+            end_event.record()
+            end_event.synchronize()
+            self.last_topk_time_ms = start_event.elapsed_time(end_event)
+        else:
+            self.last_topk_time_ms = (time.perf_counter() - start_time) * 1000.0
 
         return values, indices
 
@@ -287,10 +304,18 @@ class MatryoshkaBatchTopKTrainer(SAETrainer):
             "effective_l0",
             "dead_features",
             "pre_norm_auxk_loss",
+            "step_time_ms",
+            "topk_time_ms",
+            "topk_frac_of_step",
+            "samples_per_sec",
         ]
         self.effective_l0 = -1
         self.dead_features = -1
         self.pre_norm_auxk_loss = -1
+        self.step_time_ms = 0.0
+        self.topk_time_ms = 0.0
+        self.topk_frac_of_step = 0.0
+        self.samples_per_sec = 0.0
 
     def update_annealed_k(
         self, step: int, activation_dim: int, k_anneal_steps: Optional[int] = None
@@ -433,12 +458,23 @@ class MatryoshkaBatchTopKTrainer(SAETrainer):
             )
 
     def update(self, step, x):
+        use_cuda_timing = x.is_cuda or (
+            isinstance(self.device, str) and "cuda" in self.device
+        )
+        if use_cuda_timing:
+            step_start_event = t.cuda.Event(enable_timing=True)
+            step_end_event = t.cuda.Event(enable_timing=True)
+            step_start_event.record()
+        else:
+            step_start_time = time.perf_counter()
+
         if step == 0:
             median = self.geometric_median(x)
             self.ae.b_dec.data = median
 
         x = x.to(self.device)
         loss = self.loss(x, step=step)
+        self.topk_time_ms = float(self.ae.last_topk_time_ms)
         loss.backward()
 
         # We must transpose because we are using nn.Parameter, not nn.Linear
@@ -459,6 +495,20 @@ class MatryoshkaBatchTopKTrainer(SAETrainer):
         self.ae.W_dec.data = set_decoder_norm_to_unit_norm(
             self.ae.W_dec.T, self.ae.activation_dim, self.ae.dict_size
         ).T
+
+        if use_cuda_timing:
+            step_end_event.record()
+            step_end_event.synchronize()
+            self.step_time_ms = step_start_event.elapsed_time(step_end_event)
+        else:
+            self.step_time_ms = (time.perf_counter() - step_start_time) * 1000.0
+
+        if self.step_time_ms > 0:
+            self.topk_frac_of_step = self.topk_time_ms / self.step_time_ms
+            self.samples_per_sec = x.size(0) / (self.step_time_ms / 1000.0)
+        else:
+            self.topk_frac_of_step = 0.0
+            self.samples_per_sec = 0.0
 
         return loss.item()
 
