@@ -162,7 +162,11 @@ def main() -> None:
 
         if args.use_wandb and log_queues:
             log_queues[0].put(
-                {"eval_at_step": step, **{f"eval/{k}": v for k, v in eval_results.items()}}
+                {
+                    "step": step,
+                    "eval_at_step": step,
+                    **{f"eval/{k}": v for k, v in eval_results.items()},
+                }
             )
 
     trainSAE(
