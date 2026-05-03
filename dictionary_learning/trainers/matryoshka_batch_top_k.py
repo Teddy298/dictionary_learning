@@ -3,10 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import einops
 from collections import namedtuple
-from typing import Optional
+from typing import Callable, Optional
 from math import isclose
 
 from ..dictionary import Dictionary
+from .batch_top_k import ks_topk_triton
 from ..trainers.trainer import (
     SAETrainer,
     get_lr_schedule,
@@ -36,16 +37,27 @@ def apply_temperature(probabilities: list[float], temperature: float) -> list[fl
 
 class MatryoshkaBatchTopKSAE(Dictionary, nn.Module):
     def __init__(
-        self, activation_dim: int, dict_size: int, k: int, group_sizes: list[int]
+        self,
+        activation_dim: int,
+        dict_size: int,
+        k: int,
+        group_sizes: list[int],
+        topk: str = "torch",
+        batch_topk: Optional[Callable[[t.Tensor, int], tuple[t.Tensor, t.Tensor]]] = None,
+        batch_topk_name: str = "torch.topk",
     ):
         super().__init__()
         self.activation_dim = activation_dim
         self.dict_size = dict_size
+        self.topk = topk
+        self.batch_topk_name = batch_topk_name
 
         assert sum(group_sizes) == dict_size, "group sizes must sum to dict_size"
         assert all(s > 0 for s in group_sizes), "all group sizes must be positive"
 
         assert isinstance(k, int) and k > 0, f"k={k} must be a positive integer"
+        if topk not in {"torch", "our"}:
+            raise ValueError(f"topk={topk!r} must be 'torch' or 'our'")
         self.register_buffer("k", t.tensor(k, dtype=t.int))
         self.register_buffer("threshold", t.tensor(-1.0, dtype=t.float32))
 
@@ -68,6 +80,33 @@ class MatryoshkaBatchTopKSAE(Dictionary, nn.Module):
         ).T
         self.W_enc.data = self.W_dec.data.clone().T
 
+        if batch_topk is not None:
+            self.batch_topk = batch_topk
+            self.batch_topk_name = batch_topk_name
+        elif topk == "our":
+            self.batch_topk = ks_topk_triton
+            self.batch_topk_name = "our"
+        else:
+            self.batch_topk = None
+            self.batch_topk_name = "torch.topk"
+
+    def select_batch_topk(
+        self, flattened_acts: t.Tensor, k: int
+    ) -> tuple[t.Tensor, t.Tensor]:
+        if self.batch_topk is None:
+            post_topk = flattened_acts.topk(k, sorted=False, dim=-1)
+            return post_topk.values, post_topk.indices
+
+        post_topk = self.batch_topk(flattened_acts, k)
+
+        if hasattr(post_topk, "values") and hasattr(post_topk, "indices"):
+            values = post_topk.values
+            indices = post_topk.indices
+        else:
+            values, indices = post_topk
+
+        return values, indices
+
     def encode(
         self, x: t.Tensor, return_active: bool = False, use_threshold: bool = True
     ):
@@ -82,11 +121,12 @@ class MatryoshkaBatchTopKSAE(Dictionary, nn.Module):
         else:
             # Flatten and perform batch top-k
             flattened_acts = post_relu_feat_acts_BF.flatten()
-            post_topk = flattened_acts.topk(self.k * x.size(0), sorted=False, dim=-1)
+            topk_count = self.k.item() * x.size(0)
+            topk_values, topk_indices = self.select_batch_topk(flattened_acts, topk_count)
 
             encoded_acts_BF = (
                 t.zeros_like(post_relu_feat_acts_BF.flatten())
-                .scatter_(-1, post_topk.indices, post_topk.values)
+                .scatter_(-1, topk_indices, topk_values)
                 .reshape(post_relu_feat_acts_BF.shape)
             )
 
@@ -130,7 +170,15 @@ class MatryoshkaBatchTopKSAE(Dictionary, nn.Module):
 
         group_sizes = state_dict["group_sizes"].tolist()
 
-        autoencoder = cls(activation_dim, dict_size, k=k, group_sizes=group_sizes)
+        autoencoder = cls(
+            activation_dim,
+            dict_size,
+            k=k,
+            group_sizes=group_sizes,
+            topk=kwargs.get("topk", "torch"),
+            batch_topk=kwargs.get("batch_topk"),
+            batch_topk_name=kwargs.get("batch_topk_name", "torch.topk"),
+        )
         autoencoder.load_state_dict(state_dict)
         if device is not None:
             autoencoder.to(device)
@@ -160,6 +208,9 @@ class MatryoshkaBatchTopKTrainer(SAETrainer):
         device: Optional[str] = None,
         wandb_name: str = "BatchTopKSAE",
         submodule_name: Optional[str] = None,
+        topk: str = "torch",
+        batch_topk: Optional[Callable[[t.Tensor, int], tuple[t.Tensor, t.Tensor]]] = None,
+        batch_topk_name: str = "torch.topk",
     ):
         super().__init__(seed)
         assert layer is not None and lm_name is not None
@@ -174,6 +225,7 @@ class MatryoshkaBatchTopKTrainer(SAETrainer):
         self.threshold_beta = threshold_beta
         self.threshold_start_step = threshold_start_step
         self.k_anneal_steps = k_anneal_steps
+        self.topk = topk
 
         if seed is not None:
             t.manual_seed(seed)
@@ -196,7 +248,16 @@ class MatryoshkaBatchTopKTrainer(SAETrainer):
         self.group_sizes = group_sizes
         self.group_weights = group_weights
 
-        self.ae = dict_class(activation_dim, dict_size, k, group_sizes)
+        self.batch_topk_name = batch_topk_name
+        self.ae = dict_class(
+            activation_dim,
+            dict_size,
+            k,
+            group_sizes,
+            topk=topk,
+            batch_topk=batch_topk,
+            batch_topk_name=batch_topk_name,
+        )
 
         if device is None:
             self.device = "cuda" if t.cuda.is_available() else "cpu"
@@ -426,6 +487,8 @@ class MatryoshkaBatchTopKTrainer(SAETrainer):
             "lm_name": self.lm_name,
             "wandb_name": self.wandb_name,
             "submodule_name": self.submodule_name,
+            "topk": self.topk,
+            "batch_topk_name": self.batch_topk_name,
         }
 
     @staticmethod
