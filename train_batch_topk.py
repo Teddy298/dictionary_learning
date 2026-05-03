@@ -163,6 +163,7 @@ def main() -> None:
         if args.use_wandb and log_queues:
             log_queues[0].put(
                 {
+                    "_step": step,
                     "step": step,
                     "eval_at_step": step,
                     **{f"eval/{k}": v for k, v in eval_results.items()},
@@ -212,22 +213,6 @@ def main() -> None:
         with open(eval_path, "w") as f:
             json.dump(eval_results, f, indent=2, sort_keys=True)
 
-        if args.use_wandb:
-            wandb.init(
-                entity=args.wandb_entity or None,
-                project=args.wandb_project,
-                name=f"BatchTopKSAE-{topk_impl}-final-eval",
-                reinit=True,
-                config={
-                    "model_name": args.model_name,
-                    "dataset_name": args.dataset_name,
-                    "topk_impl": topk_impl,
-                    "save_dir": str(save_dir),
-                    "eval_n_batches": args.eval_n_batches,
-                },
-            )
-            wandb.log({f"eval/{k}": v for k, v in eval_results.items()})
-            wandb.finish()
 
 
 if __name__ == "__main__":
