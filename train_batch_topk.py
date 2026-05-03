@@ -1,10 +1,10 @@
 import argparse
+import csv
 import json
 import multiprocessing as mp
 from pathlib import Path
 
 from nnsight import LanguageModel
-import wandb
 
 from dictionary_learning import ActivationBuffer
 from dictionary_learning.evaluation import evaluate
@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-llm-batch-size", type=int, default=100)
     parser.add_argument("--eval-sae-batch-size", type=int, default=4096)
     parser.add_argument("--eval-n-ctxs", type=int, default=256)
+    parser.add_argument("--eval-log-file", default="eval_history.jsonl")
     return parser.parse_args()
 
 
@@ -140,11 +141,27 @@ def main() -> None:
             f"entity={args.wandb_entity or '<default>'}, log_steps={args.log_steps}"
         )
 
+    trainer_dir = save_dir / "trainer_0"
+    eval_history_path = trainer_dir / args.eval_log_file
+    eval_history_csv_path = trainer_dir / "eval_history.csv"
+
+    def append_eval_record(step: int, eval_results: dict[str, float]) -> None:
+        trainer_dir.mkdir(parents=True, exist_ok=True)
+        record = {"step": step, **eval_results}
+        with open(eval_history_path, "a") as f:
+            f.write(json.dumps(record, sort_keys=True) + "\n")
+
+        csv_exists = eval_history_csv_path.exists()
+        with open(eval_history_csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(record.keys()))
+            if not csv_exists:
+                writer.writeheader()
+            writer.writerow(record)
+
     def post_step_callback(step: int, trainers: list, log_queues: list) -> None:
         if not args.run_eval or args.eval_every <= 0 or step % args.eval_every != 0:
             return
 
-        trainer_dir = save_dir / "trainer_0"
         eval_path = trainer_dir / f"eval_results_step_{step}.json"
         eval_results = run_eval(
             args=args,
@@ -159,16 +176,7 @@ def main() -> None:
 
         with open(eval_path, "w") as f:
             json.dump(eval_results, f, indent=2, sort_keys=True)
-
-        if args.use_wandb and log_queues:
-            log_queues[0].put(
-                {
-                    "_step": step,
-                    "step": step,
-                    "eval_at_step": step,
-                    **{f"eval/{k}": v for k, v in eval_results.items()},
-                }
-            )
+        append_eval_record(step, eval_results)
 
     trainSAE(
         data=buffer,
@@ -189,7 +197,6 @@ def main() -> None:
     )
 
     if args.run_eval:
-        trainer_dir = save_dir / "trainer_0"
         ae_path = trainer_dir / "ae.pt"
         eval_path = trainer_dir / "eval_results.json"
 
@@ -212,6 +219,7 @@ def main() -> None:
 
         with open(eval_path, "w") as f:
             json.dump(eval_results, f, indent=2, sort_keys=True)
+        append_eval_record(args.steps, eval_results)
 
 
 
