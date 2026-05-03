@@ -6,7 +6,7 @@ import json
 import torch.multiprocessing as mp
 import os
 from queue import Empty
-from typing import Optional
+from typing import Callable, Optional
 from contextlib import nullcontext
 
 import torch as t
@@ -127,6 +127,7 @@ def trainSAE(
     device:str="cuda",
     autocast_dtype: t.dtype = t.float32,
     backup_steps:Optional[int]=None,
+    post_step_callback: Optional[Callable[[int, list, list], None]] = None,
 ):
     """
     Train SAEs using the given trainers
@@ -256,6 +257,9 @@ def trainSAE(
         for trainer in trainers:
             with autocast_context:
                 trainer.update(step, act)
+
+        if post_step_callback is not None:
+            post_step_callback(step + 1, trainers, log_queues)
 
     # save final SAEs
     for save_dir, trainer in zip(save_dirs, trainers):

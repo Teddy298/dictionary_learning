@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-entity", default="")
     parser.add_argument("--log-steps", type=int, default=100)
     parser.add_argument("--run-eval", action="store_true")
+    parser.add_argument("--eval-every", type=int, default=0)
     parser.add_argument("--eval-n-batches", type=int, default=10)
     parser.add_argument("--eval-llm-batch-size", type=int, default=100)
     parser.add_argument("--eval-sae-batch-size", type=int, default=4096)
@@ -63,6 +64,31 @@ def make_buffer(
         device=args.device,
         refresh_batch_size=llm_batch_size,
         out_batch_size=sae_batch_size,
+    )
+
+
+def run_eval(
+    args: argparse.Namespace,
+    model: LanguageModel,
+    submodule,
+    activation_dim: int,
+    dictionary: BatchTopKSAE,
+) -> dict[str, float]:
+    eval_buffer = make_buffer(
+        args=args,
+        model=model,
+        submodule=submodule,
+        activation_dim=activation_dim,
+        llm_batch_size=args.eval_llm_batch_size,
+        sae_batch_size=args.eval_sae_batch_size,
+        n_ctxs=args.eval_n_ctxs,
+    )
+    return evaluate(
+        dictionary=dictionary,
+        activations=eval_buffer,
+        batch_size=args.eval_llm_batch_size,
+        device=args.device,
+        n_batches=args.eval_n_batches,
     )
 
 
@@ -114,6 +140,31 @@ def main() -> None:
             f"entity={args.wandb_entity or '<default>'}, log_steps={args.log_steps}"
         )
 
+    def post_step_callback(step: int, trainers: list, log_queues: list) -> None:
+        if not args.run_eval or args.eval_every <= 0 or step % args.eval_every != 0:
+            return
+
+        trainer_dir = save_dir / "trainer_0"
+        eval_path = trainer_dir / f"eval_results_step_{step}.json"
+        eval_results = run_eval(
+            args=args,
+            model=model,
+            submodule=submodule,
+            activation_dim=activation_dim,
+            dictionary=trainers[0].ae.to(dtype=model.dtype),
+        )
+
+        print(f"Evaluation results at step {step}:")
+        print(json.dumps(eval_results, indent=2, sort_keys=True))
+
+        with open(eval_path, "w") as f:
+            json.dump(eval_results, f, indent=2, sort_keys=True)
+
+        if args.use_wandb and log_queues:
+            log_queues[0].put(
+                {"eval_at_step": step, **{f"eval/{k}": v for k, v in eval_results.items()}}
+            )
+
     trainSAE(
         data=buffer,
         trainer_configs=[trainer_cfg],
@@ -129,6 +180,7 @@ def main() -> None:
             "topk_impl": topk_impl,
             "save_dir": str(save_dir),
         },
+        post_step_callback=post_step_callback,
     )
 
     if args.run_eval:
@@ -142,21 +194,12 @@ def main() -> None:
             device=args.device,
             topk=topk_impl,
         ).to(dtype=model.dtype)
-        eval_buffer = make_buffer(
+        eval_results = run_eval(
             args=args,
             model=model,
             submodule=submodule,
             activation_dim=activation_dim,
-            llm_batch_size=args.eval_llm_batch_size,
-            sae_batch_size=args.eval_sae_batch_size,
-            n_ctxs=args.eval_n_ctxs,
-        )
-        eval_results = evaluate(
             dictionary=dictionary,
-            activations=eval_buffer,
-            batch_size=args.eval_llm_batch_size,
-            device=args.device,
-            n_batches=args.eval_n_batches,
         )
 
         print("Evaluation results:")
