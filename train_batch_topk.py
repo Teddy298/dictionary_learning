@@ -1,10 +1,13 @@
 import argparse
+import json
 import multiprocessing as mp
 from pathlib import Path
 
 from nnsight import LanguageModel
+import wandb
 
 from dictionary_learning import ActivationBuffer
+from dictionary_learning.evaluation import evaluate
 from dictionary_learning.training import trainSAE
 from dictionary_learning.trainers.batch_top_k import BatchTopKSAE, BatchTopKTrainer
 from dictionary_learning.utils import hf_dataset_to_generator
@@ -33,7 +36,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-project", default="dictionary_learning")
     parser.add_argument("--wandb-entity", default="")
     parser.add_argument("--log-steps", type=int, default=100)
+    parser.add_argument("--run-eval", action="store_true")
+    parser.add_argument("--eval-n-batches", type=int, default=10)
+    parser.add_argument("--eval-llm-batch-size", type=int, default=100)
+    parser.add_argument("--eval-sae-batch-size", type=int, default=4096)
+    parser.add_argument("--eval-n-ctxs", type=int, default=256)
     return parser.parse_args()
+
+
+def make_buffer(
+    args: argparse.Namespace,
+    model: LanguageModel,
+    submodule,
+    activation_dim: int,
+    llm_batch_size: int,
+    sae_batch_size: int,
+    n_ctxs: int,
+) -> ActivationBuffer:
+    data = hf_dataset_to_generator(args.dataset_name)
+    return ActivationBuffer(
+        data=data,
+        model=model,
+        submodule=submodule,
+        d_submodule=activation_dim,
+        n_ctxs=n_ctxs,
+        device=args.device,
+        refresh_batch_size=llm_batch_size,
+        out_batch_size=sae_batch_size,
+    )
 
 
 def main() -> None:
@@ -45,17 +75,14 @@ def main() -> None:
     activation_dim = model.config.hidden_size
     dict_size = args.expansion_factor * activation_dim
 
-    data = hf_dataset_to_generator(args.dataset_name)
-
-    buffer = ActivationBuffer(
-        data=data,
+    buffer = make_buffer(
+        args=args,
         model=model,
         submodule=submodule,
-        d_submodule=activation_dim,
+        activation_dim=activation_dim,
+        llm_batch_size=args.llm_batch_size,
+        sae_batch_size=args.sae_batch_size,
         n_ctxs=args.n_ctxs,
-        device=args.device,
-        refresh_batch_size=args.llm_batch_size,
-        out_batch_size=args.sae_batch_size,
     )
 
     trainer_cfg = {
@@ -103,6 +130,57 @@ def main() -> None:
             "save_dir": str(save_dir),
         },
     )
+
+    if args.run_eval:
+        trainer_dir = save_dir / "trainer_0"
+        ae_path = trainer_dir / "ae.pt"
+        eval_path = trainer_dir / "eval_results.json"
+
+        dictionary = BatchTopKSAE.from_pretrained(
+            str(ae_path),
+            k=args.k,
+            device=args.device,
+            topk=topk_impl,
+        ).to(dtype=model.dtype)
+        eval_buffer = make_buffer(
+            args=args,
+            model=model,
+            submodule=submodule,
+            activation_dim=activation_dim,
+            llm_batch_size=args.eval_llm_batch_size,
+            sae_batch_size=args.eval_sae_batch_size,
+            n_ctxs=args.eval_n_ctxs,
+        )
+        eval_results = evaluate(
+            dictionary=dictionary,
+            activations=eval_buffer,
+            batch_size=args.eval_llm_batch_size,
+            device=args.device,
+            n_batches=args.eval_n_batches,
+        )
+
+        print("Evaluation results:")
+        print(json.dumps(eval_results, indent=2, sort_keys=True))
+
+        with open(eval_path, "w") as f:
+            json.dump(eval_results, f, indent=2, sort_keys=True)
+
+        if args.use_wandb:
+            wandb.init(
+                entity=args.wandb_entity or None,
+                project=args.wandb_project,
+                name=f"BatchTopKSAE-{topk_impl}-final-eval",
+                reinit=True,
+                config={
+                    "model_name": args.model_name,
+                    "dataset_name": args.dataset_name,
+                    "topk_impl": topk_impl,
+                    "save_dir": str(save_dir),
+                    "eval_n_batches": args.eval_n_batches,
+                },
+            )
+            wandb.log({f"eval/{k}": v for k, v in eval_results.items()})
+            wandb.finish()
 
 
 if __name__ == "__main__":
