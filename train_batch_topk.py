@@ -23,13 +23,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-name", default="openwebtext")
     parser.add_argument("--layer", type=int, default=1)
     parser.add_argument("--steps", type=int, default=244141)
-    parser.add_argument("--k", type=int, default=32)
+    parser.add_argument("--k", type=int, default=12)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--threshold-start-step", type=int, default=1000)
-    parser.add_argument("--expansion-factor", type=int, default=16)
+    parser.add_argument("--expansion-factor", type=int, default=32)
     parser.add_argument("--llm-batch-size", type=int, default=16)
-    parser.add_argument("--sae-batch-size", type=int, default=4096)
+    parser.add_argument("--sae-batch-size", type=int, default=1024)
     parser.add_argument("--n-ctxs", type=int, default=100)
     parser.add_argument("--save-dir", default="runs/batch_topk")
     parser.add_argument("--use-wandb", action="store_true")
@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-sae-batch-size", type=int, default=4096)
     parser.add_argument("--eval-n-ctxs", type=int, default=256)
     parser.add_argument("--eval-log-file", default="eval_history.jsonl")
+    parser.add_argument("--train-log-file", default="train_history.jsonl")
     return parser.parse_args()
 
 
@@ -162,6 +163,8 @@ def main() -> None:
     trainer_dir = save_dir / "trainer_0"
     eval_history_path = trainer_dir / args.eval_log_file
     eval_history_csv_path = trainer_dir / "eval_history.csv"
+    train_history_path = trainer_dir / args.train_log_file
+    train_history_csv_path = trainer_dir / "train_history.csv"
 
     def append_eval_record(step: int, eval_results: dict[str, float]) -> None:
         trainer_dir.mkdir(parents=True, exist_ok=True)
@@ -176,7 +179,36 @@ def main() -> None:
                 writer.writeheader()
             writer.writerow(record)
 
+    def append_train_record(step: int, trainer: BatchTopKTrainer) -> None:
+        trainer_dir.mkdir(parents=True, exist_ok=True)
+        record = {
+            "step": step,
+            "step_time_ms": float(trainer.step_time_ms),
+            "topk_time_ms": float(trainer.topk_time_ms),
+            "topk_frac_of_step": float(trainer.topk_frac_of_step),
+            "samples_per_sec": float(trainer.samples_per_sec),
+            "effective_l0": float(trainer.effective_l0),
+            "dead_features": float(trainer.dead_features),
+            "pre_norm_auxk_loss": (
+                float(trainer.pre_norm_auxk_loss)
+                if not hasattr(trainer.pre_norm_auxk_loss, "item")
+                else float(trainer.pre_norm_auxk_loss.item())
+            ),
+        }
+        with open(train_history_path, "a") as f:
+            f.write(json.dumps(record, sort_keys=True) + "\n")
+
+        csv_exists = train_history_csv_path.exists()
+        with open(train_history_csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(record.keys()))
+            if not csv_exists:
+                writer.writeheader()
+            writer.writerow(record)
+
     def post_step_callback(step: int, trainers: list, log_queues: list) -> None:
+        del log_queues
+        append_train_record(step, trainers[0])
+
         if not args.run_eval or args.eval_every <= 0 or step % args.eval_every != 0:
             return
 

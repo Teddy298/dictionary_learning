@@ -181,7 +181,8 @@ def evaluate(
         x_hat, f = dictionary(x, output_features=True)
         l2_loss = t.linalg.norm(x - x_hat, dim=-1).mean()
         l1_loss = f.norm(p=1, dim=-1).mean()
-        l0 = (f != 0).float().sum(dim=-1).mean()
+        active_latents_per_sample = (f != 0).float().sum(dim=-1)
+        l0 = active_latents_per_sample.mean()
         
         features_BF = t.flatten(f, start_dim=0, end_dim=-2).to(dtype=t.float32) # If f is shape (B, L, D), flatten to (B*L, D)
         assert features_BF.shape[-1] == dictionary.dict_size
@@ -201,6 +202,7 @@ def evaluate(
         total_variance = t.var(x, dim=0).sum()
         residual_variance = t.var(x - x_hat, dim=0).sum()
         frac_variance_explained = (1 - residual_variance / total_variance)
+        nmse = residual_variance / total_variance
 
         # Equation 10 from https://arxiv.org/abs/2404.16014
         x_hat_norm_squared = t.linalg.norm(x_hat, dim=-1, ord=2)**2
@@ -210,7 +212,12 @@ def evaluate(
         out["l2_loss"] += l2_loss.item()
         out["l1_loss"] += l1_loss.item()
         out["l0"] += l0.item()
+        out["active_latents_mean"] += l0.item()
+        out["active_latents_std"] += active_latents_per_sample.std(unbiased=False).item()
+        out["active_latents_min"] += active_latents_per_sample.min().item()
+        out["active_latents_max"] += active_latents_per_sample.max().item()
         out["frac_variance_explained"] += frac_variance_explained.item()
+        out["nmse"] += nmse.item()
         out["cossim"] += cossim.item()
         out["l2_ratio"] += l2_ratio.item()
         out['relative_reconstruction_bias'] += relative_reconstruction_bias.item()
@@ -230,11 +237,15 @@ def evaluate(
             tracer_args=tracer_args
         )
         frac_recovered = (loss_reconstructed - loss_zero) / (loss_original - loss_zero)
+        ce_degradation = loss_reconstructed - loss_original
+        zero_ablation_ce_degradation = loss_zero - loss_original
         
         out["loss_original"] += loss_original.item()
         out["loss_reconstructed"] += loss_reconstructed.item()
         out["loss_zero"] += loss_zero.item()
         out["frac_recovered"] += frac_recovered.item()
+        out["ce_degradation"] += ce_degradation.item()
+        out["zero_ablation_ce_degradation"] += zero_ablation_ce_degradation.item()
 
     out = {key: value / n_batches for key, value in out.items()}
     frac_alive = (active_features != 0).float().sum() / dictionary.dict_size
