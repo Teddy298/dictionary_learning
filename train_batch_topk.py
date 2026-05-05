@@ -44,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-n-ctxs", type=int, default=256)
     parser.add_argument("--eval-log-file", default="eval_history.jsonl")
     parser.add_argument("--train-log-file", default="train_history.jsonl")
+    parser.add_argument("--skip-final-eval", action="store_true")
     return parser.parse_args()
 
 
@@ -252,7 +253,7 @@ def main() -> None:
         post_step_callback=post_step_callback,
     )
 
-    if args.run_eval:
+    if args.run_eval and not args.skip_final_eval:
         ae_path = trainer_dir / "ae.pt"
         eval_path = trainer_dir / "eval_results.json"
 

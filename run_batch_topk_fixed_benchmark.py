@@ -60,6 +60,7 @@ def run_variant(args: argparse.Namespace, *, our: bool) -> None:
         "--save-dir", args.save_dir,
         "--log-steps", str(args.log_steps),
         "--run-eval",
+        "--skip-final-eval",
         "--eval-every", str(args.eval_every),
         "--eval-n-batches", str(args.eval_n_batches),
         "--eval-llm-batch-size", str(args.eval_llm_batch_size),
