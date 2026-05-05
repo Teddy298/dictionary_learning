@@ -182,6 +182,24 @@ def write_pair_results(csv_path: Path, results: list[dict]) -> None:
         writer.writerows(results)
 
 
+def build_best_summary(
+    results: list[dict], args: argparse.Namespace, start_time: float
+) -> dict:
+    best = max(
+        results,
+        key=lambda row: (row["step_speedup_ratio"], row["step_time_delta_ms"]),
+    )
+    return {
+        "selection_metric": "max step_speedup_ratio, then max step_time_delta_ms",
+        "max_hours": args.max_hours,
+        "steps_per_run": args.steps,
+        "ignore_first_steps": args.ignore_first_steps,
+        "best": best,
+        "tested_pairs": len(results),
+        "elapsed_seconds": time.perf_counter() - start_time,
+    }
+
+
 def main() -> None:
     args = parse_args()
     k_values = parse_int_list(args.k_values)
@@ -281,25 +299,15 @@ def main() -> None:
         write_pair_results(run_root / "pair_results.csv", all_pair_results)
         with open(run_root / "pair_results.json", "w") as f:
             json.dump(all_pair_results, f, indent=2)
+        with open(run_root / "best_params.json", "w") as f:
+            json.dump(build_best_summary(all_pair_results, args, start_time), f, indent=2)
 
         print(json.dumps(pair_result, indent=2))
 
     if not all_pair_results:
         raise RuntimeError("No paired results were produced.")
 
-    best = max(
-        all_pair_results,
-        key=lambda row: (row["step_speedup_ratio"], row["step_time_delta_ms"]),
-    )
-    summary = {
-        "selection_metric": "max step_speedup_ratio, then max step_time_delta_ms",
-        "max_hours": args.max_hours,
-        "steps_per_run": args.steps,
-        "ignore_first_steps": args.ignore_first_steps,
-        "best": best,
-        "tested_pairs": len(all_pair_results),
-        "elapsed_seconds": time.perf_counter() - start_time,
-    }
+    summary = build_best_summary(all_pair_results, args, start_time)
 
     with open(run_root / "best_params.json", "w") as f:
         json.dump(summary, f, indent=2)
