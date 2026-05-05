@@ -104,8 +104,6 @@ def run_single_config(
     )
 
     run_name = f"BatchTopKSpeed-{topk_impl}-k{k}-d{dict_size}-b{sae_batch_size}"
-    save_dir = run_root / f"k{k}_d{dict_size}_b{sae_batch_size}_{topk_impl}"
-
     step_times: list[float] = []
     topk_times: list[float] = []
     topk_fracs: list[float] = []
@@ -143,7 +141,7 @@ def run_single_config(
         data=buffer,
         trainer_configs=[trainer_cfg],
         steps=args.steps,
-        save_dir=str(save_dir),
+        save_dir=None,
         use_wandb=args.use_wandb,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
