@@ -23,6 +23,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use topk='our_new' instead of topk='torch'.",
     )
+    parser.add_argument("--our_1", action="store_true", help="Use topk='our_1'.")
+    parser.add_argument("--our_2", action="store_true", help="Use topk='our_2'.")
+    parser.add_argument("--our_3", action="store_true", help="Use topk='our_3'.")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--model-name", default="EleutherAI/pythia-70m-deduped")
     parser.add_argument("--dataset-name", default="openwebtext")
@@ -120,14 +123,20 @@ def clone_dictionary_for_eval(
 
 def main() -> None:
     args = parse_args()
-    if args.our and args.our_new:
-        raise ValueError("Use at most one of --our or --our_new.")
-    if args.our_new:
-        topk_impl = "our_new"
-    elif args.our:
-        topk_impl = "our"
-    else:
-        topk_impl = "torch"
+    selected = [
+        name
+        for name, enabled in [
+            ("our", args.our),
+            ("our_new", args.our_new),
+            ("our_1", args.our_1),
+            ("our_2", args.our_2),
+            ("our_3", args.our_3),
+        ]
+        if enabled
+    ]
+    if len(selected) > 1:
+        raise ValueError("Use at most one of --our, --our_new, --our_1, --our_2, or --our_3.")
+    topk_impl = selected[0] if selected else "torch"
 
     model = LanguageModel(args.model_name, device_map=args.device)
     submodule = model.gpt_neox.layers[args.layer].mlp
