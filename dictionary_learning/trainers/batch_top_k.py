@@ -349,7 +349,8 @@ def ks_topk_triton_fixed(
         return post_topk.values.reshape(-1), post_topk.indices.reshape(-1)
 
     final_top_idx = out_idx.gather(1, final_local_idx)
-    return final_top_vals.reshape(-1), final_top_idx.reshape(-1)
+    gathered_vals = x.gather(1, final_top_idx)
+    return gathered_vals.reshape(-1), final_top_idx.reshape(-1)
 
 
 def ks_topk_triton_1(x: t.Tensor, k: int) -> tuple[t.Tensor, t.Tensor]:
@@ -418,7 +419,8 @@ def ks_topk_triton_fixed_nofallback(
 
     final_top_vals, final_local_idx = t.topk(out_vals, k, dim=1, sorted=False)
     final_top_idx = out_idx.gather(1, final_local_idx)
-    return final_top_vals.reshape(-1), final_top_idx.reshape(-1)
+    gathered_vals = x.gather(1, final_top_idx)
+    return gathered_vals.reshape(-1), final_top_idx.reshape(-1)
 
 
 def ks_topk_triton_4(x: t.Tensor, k: int) -> tuple[t.Tensor, t.Tensor]:
