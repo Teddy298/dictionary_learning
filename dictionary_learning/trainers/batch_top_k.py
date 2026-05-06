@@ -364,6 +364,75 @@ def ks_topk_triton_3(x: t.Tensor, k: int) -> tuple[t.Tensor, t.Tensor]:
     return ks_topk_triton_fixed(x, k, s=43099, t_rank=150, max_out=196608)
 
 
+def ks_topk_triton_fixed_nofallback(
+    x: t.Tensor,
+    k: int,
+    s: int,
+    t_rank: int,
+    max_out: int,
+) -> tuple[t.Tensor, t.Tensor]:
+    if triton is None:
+        raise RuntimeError("fixed Triton topk variants require Triton to be installed.")
+    if not x.is_cuda:
+        raise RuntimeError("fixed Triton topk variants require CUDA tensors.")
+
+    if x.dim() == 1:
+        x = x.unsqueeze(0)
+
+    x = x.contiguous()
+    batch_size, n = x.shape
+    if k <= 0 or k > n:
+        raise ValueError(f"k={k} must satisfy 0 < k <= n={n}")
+
+    stride = max(1, (n - s + 1) // s)
+    sample = x[:, ::stride]
+    if sample.size(1) > s:
+        sample = sample[:, :s]
+
+    effective_t = min(t_rank, sample.size(1))
+    if effective_t <= 0:
+        post_topk = x.topk(k, dim=1)
+        return post_topk.values.reshape(-1), post_topk.indices.reshape(-1)
+
+    sample_top, _ = t.topk(sample, effective_t, dim=1, sorted=False)
+    thresholds = sample_top[:, -1].contiguous()
+
+    out_vals = t.full(
+        (batch_size, max_out), -float("inf"), dtype=x.dtype, device=x.device
+    )
+    out_idx = t.empty((batch_size, max_out), dtype=t.int64, device=x.device)
+    counts = t.zeros(batch_size, dtype=t.int32, device=x.device)
+
+    grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), batch_size)
+    _filter_topk_batched_kernel[grid](
+        x,
+        out_vals,
+        out_idx,
+        counts,
+        thresholds,
+        x.stride(0),
+        out_vals.stride(0),
+        n,
+        max_out,
+    )
+
+    final_top_vals, final_local_idx = t.topk(out_vals, k, dim=1, sorted=False)
+    final_top_idx = out_idx.gather(1, final_local_idx)
+    return final_top_vals.reshape(-1), final_top_idx.reshape(-1)
+
+
+def ks_topk_triton_4(x: t.Tensor, k: int) -> tuple[t.Tensor, t.Tensor]:
+    return ks_topk_triton_fixed_nofallback(x, k, s=32768, t_rank=110, max_out=201167)
+
+
+def ks_topk_triton_5(x: t.Tensor, k: int) -> tuple[t.Tensor, t.Tensor]:
+    return ks_topk_triton_fixed_nofallback(x, k, s=32768, t_rank=118, max_out=230234)
+
+
+def ks_topk_triton_6(x: t.Tensor, k: int) -> tuple[t.Tensor, t.Tensor]:
+    return ks_topk_triton_fixed_nofallback(x, k, s=43099, t_rank=150, max_out=196608)
+
+
 class BatchTopKSAE(Dictionary, nn.Module):
     def __init__(
         self,
@@ -381,9 +450,9 @@ class BatchTopKSAE(Dictionary, nn.Module):
         self.batch_topk_name = batch_topk_name
 
         assert isinstance(k, int) and k > 0, f"k={k} must be a positive integer"
-        if topk not in {"torch", "our", "our_new", "our_1", "our_2", "our_3"}:
+        if topk not in {"torch", "our", "our_new", "our_1", "our_2", "our_3", "our_4", "our_5", "our_6"}:
             raise ValueError(
-                f"topk={topk!r} must be 'torch', 'our', 'our_new', 'our_1', 'our_2', or 'our_3'"
+                f"topk={topk!r} must be 'torch', 'our', 'our_new', 'our_1', 'our_2', 'our_3', 'our_4', 'our_5', or 'our_6'"
             )
         self.register_buffer("k", t.tensor(k, dtype=t.int))
         self.register_buffer("threshold", t.tensor(-1.0, dtype=t.float32))
@@ -416,6 +485,15 @@ class BatchTopKSAE(Dictionary, nn.Module):
         elif topk == "our_3":
             self.batch_topk = ks_topk_triton_3
             self.batch_topk_name = "our_3"
+        elif topk == "our_4":
+            self.batch_topk = ks_topk_triton_4
+            self.batch_topk_name = "our_4"
+        elif topk == "our_5":
+            self.batch_topk = ks_topk_triton_5
+            self.batch_topk_name = "our_5"
+        elif topk == "our_6":
+            self.batch_topk = ks_topk_triton_6
+            self.batch_topk_name = "our_6"
         else:
             self.batch_topk = None
             self.batch_topk_name = "torch.topk"

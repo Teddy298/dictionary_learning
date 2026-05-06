@@ -26,6 +26,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--our_1", action="store_true", help="Use topk='our_1'.")
     parser.add_argument("--our_2", action="store_true", help="Use topk='our_2'.")
     parser.add_argument("--our_3", action="store_true", help="Use topk='our_3'.")
+    parser.add_argument("--our_4", action="store_true", help="Use topk='our_4'.")
+    parser.add_argument("--our_5", action="store_true", help="Use topk='our_5'.")
+    parser.add_argument("--our_6", action="store_true", help="Use topk='our_6'.")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--model-name", default="EleutherAI/pythia-70m-deduped")
     parser.add_argument("--dataset-name", default="openwebtext")
@@ -131,11 +134,14 @@ def main() -> None:
             ("our_1", args.our_1),
             ("our_2", args.our_2),
             ("our_3", args.our_3),
+            ("our_4", args.our_4),
+            ("our_5", args.our_5),
+            ("our_6", args.our_6),
         ]
         if enabled
     ]
     if len(selected) > 1:
-        raise ValueError("Use at most one of --our, --our_new, --our_1, --our_2, or --our_3.")
+        raise ValueError("Use at most one of --our, --our_new, --our_1, --our_2, --our_3, --our_4, --our_5, or --our_6.")
     topk_impl = selected[0] if selected else "torch"
 
     model = LanguageModel(args.model_name, device_map=args.device)
