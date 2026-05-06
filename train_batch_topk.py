@@ -15,9 +15,14 @@ from dictionary_learning.utils import hf_dataset_to_generator
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a Batch Top-K SAE with torch.topk or the Triton path."
+        description="Train a Batch Top-K SAE with torch.topk or one of the Triton paths."
     )
     parser.add_argument("--our", action="store_true", help="Use topk='our' instead of topk='torch'.")
+    parser.add_argument(
+        "--our_new",
+        action="store_true",
+        help="Use topk='our_new' instead of topk='torch'.",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--model-name", default="EleutherAI/pythia-70m-deduped")
     parser.add_argument("--dataset-name", default="openwebtext")
@@ -115,7 +120,14 @@ def clone_dictionary_for_eval(
 
 def main() -> None:
     args = parse_args()
-    topk_impl = "our" if args.our else "torch"
+    if args.our and args.our_new:
+        raise ValueError("Use at most one of --our or --our_new.")
+    if args.our_new:
+        topk_impl = "our_new"
+    elif args.our:
+        topk_impl = "our"
+    else:
+        topk_impl = "torch"
 
     model = LanguageModel(args.model_name, device_map=args.device)
     submodule = model.gpt_neox.layers[args.layer].mlp
